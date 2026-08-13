@@ -1,0 +1,9 @@
+# dsh-recall bundle patch: mount the recall host plugin row.
+#
+# The row name doubles as the client-modules package id: mounting this row
+# qualifies the package for the browser roster (dsh.client), so the loader
+# serves the client half at /plugins/dsh-recall/client.js and the boot
+# manifest carries it in window.__DSH_BOOT__.
+- insert:
+    - id: recall
+      name: 'dsh-recall'
