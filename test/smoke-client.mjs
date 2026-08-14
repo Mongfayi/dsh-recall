@@ -54,7 +54,7 @@ const made = handoff.factory((spec) => {
 	throw new Error('unexpected require: ' + spec)
 })
 moduleRec.exports = made
-const { apply, recallDefinition, contentParts, projectUserText } = moduleRec.exports
+const { apply, recallDefinition, contentParts, projectUserText, restoreDraft } = moduleRec.exports
 if (typeof apply !== 'function') throw new Error('exports.apply missing')
 
 const cssTags = styles.filter((t) => t.dataset && t.dataset.plugin === 'dsh-recall')
@@ -205,5 +205,59 @@ const busyControlRendered = busyControl.type(busyControl.props)
 const busyButton = (busyControlRendered.children ?? []).find((c) => c && c.props?.type === 'button')
 if (!busyButton || busyButton.props.disabled !== true) throw new Error('recall button should be disabled while the agent is running')
 console.log('recall button disabled while running')
+
+// ── restore-to-input behavior: after a successful recall, the recalled user
+// message text lands in the session's composer draft (the opencode-style undo
+// affordance). The restore must wait for the recall request to settle.
+{
+	const drafts = []
+	const scope = { id: 's1' }
+	const inputFacade = { setDraft: (text) => { drafts.push(text) } }
+	ctxStub.sessions = {
+		scope: (id) => (id === scope.id ? scope : void 0),
+	}
+	ctxStub.get = (name) => {
+		if (name === 'slots') return slotsStub
+		if (name === 'locale') return localeStub
+		if (name === 'conversationEvents') return conversationEventsStub
+		if (name === 'conversation') return { input: { for: (actx) => (actx === scope ? inputFacade : void 0) } }
+		return undefined
+	}
+	const realFetch = globalThis.fetch
+	const realConfirm = globalThis.window.confirm
+	globalThis.fetch = async () => ({ status: 200, json: async () => ({ ok: true, value: { boundary: 3 } }) })
+	globalThis.window.confirm = () => true
+
+	const el = userReg.component({
+		node: {
+			key: 'chat:user:1',
+			kind: 'user',
+			id: 'user:1',
+			target: 'chat',
+			anchorSeq: 3,
+			location: { kind: 'turn', turn: { turn: 1 } },
+			visibility: 'visible',
+			data: { kind: 'user', seq: 3, time: 1, content: [{ type: 'text', text: '把这段改一改' }] },
+		},
+		sessionId: 's1',
+		loadImage: async () => 'data:image/png;base64,',
+		useSession: (selector) => selector({ running: false }),
+		t: (k) => k,
+	})
+	const rowEl = (el.children ?? []).find((c) => c && c.props?.className === 'dsr-user-row') ?? el
+	const controlEl = (rowEl.children ?? []).find((c) => c && typeof c.type === 'function')
+	const controlTree = controlEl.type(controlEl.props)
+	const buttonEl = (controlTree.children ?? []).find((c) => c && c.props?.type === 'button')
+	buttonEl.props.onClick()
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	if (drafts.length !== 1 || drafts[0] !== '把这段改一改') throw new Error('recalled text should restore to the composer draft: ' + JSON.stringify(drafts))
+	globalThis.fetch = realFetch
+	globalThis.window.confirm = realConfirm
+	console.log('recalled message text restores to the input box after a successful recall')
+}
+
+// empty / non-text messages must not touch the draft (restoreDraft guard)
+if (restoreDraft('s1', '') !== false) throw new Error('restoreDraft must no-op on empty text')
+console.log('restoreDraft no-ops on empty text')
 
 console.log('\nCLIENT SMOKE OK')
