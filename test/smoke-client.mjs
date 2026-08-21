@@ -54,7 +54,7 @@ const made = handoff.factory((spec) => {
 	throw new Error('unexpected require: ' + spec)
 })
 moduleRec.exports = made
-const { apply, recallDefinition, contentParts, projectUserText, restoreDraft } = moduleRec.exports
+const { apply, recallDefinition, contentParts, projectUserText, restoreDraft, isRecalledAnchor, recordRecalledRange, wrapRecalledRowDefinition, installRecalledRowIntercepts } = moduleRec.exports
 if (typeof apply !== 'function') throw new Error('exports.apply missing')
 
 const cssTags = styles.filter((t) => t.dataset && t.dataset.plugin === 'dsh-recall')
@@ -64,12 +64,33 @@ if (cssTags[0].textContent.includes('.dsr-user-row') === false) throw new Error(
 
 // definition shape
 if (recallDefinition.kind !== 'recall' || recallDefinition.target !== 'chat') throw new Error('recall definition malformed')
-const match = recallDefinition.match({ type: 'session/recall', seq: 9, data: { boundary: 4 } })
+const tombstone = {
+	type: 'assistant/message',
+	seq: 9,
+	surfaceOp: { op: 'replace', start: 4, end: 7 },
+	sourceEventSeqs: [4, 7],
+	data: { turn: 1, recall: { boundary: 4, end: 7 }, message: { id: 'r', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [] } },
+}
+const match = recallDefinition.match(tombstone)
 if (!match || match.id !== '9' || match.role !== 'start') throw new Error('recall definition match failed')
 if (recallDefinition.match({ type: 'user/message', seq: 1, data: {} }) !== null) throw new Error('recall definition must not match other events')
-const start = recallDefinition.start({}, { event: { type: 'session/recall', seq: 9, time: 1, data: { boundary: 4 } } })
-if (start.boundary !== 4 || start.seq !== 9) throw new Error('recall definition start failed')
+if (recallDefinition.match({ type: 'assistant/message', seq: 2, surfaceOp: 'append', data: { message: {} } }) !== null) throw new Error('recall definition must not match plain assistant messages')
+const start = recallDefinition.start({}, { event: { type: 'assistant/message', seq: 9, time: 1, data: { recall: { boundary: 4, end: 7 } } } })
+if (start.boundary !== 4 || start.end !== 7 || start.seq !== 9) throw new Error('recall definition start failed')
 console.log('recall definition OK')
+
+// recalled-range membership (inclusive ends)
+{
+	const ranges = [{ boundary: 20, end: 23 }]
+	if (recordRecalledRange(20, 23) !== true) throw new Error('recordRecalledRange(20,23) should record')
+	if (isRecalledAnchor(19, ranges) !== false) throw new Error('before boundary must be false')
+	if (isRecalledAnchor(20, ranges) !== true) throw new Error('boundary inclusive must be true')
+	if (isRecalledAnchor(23, ranges) !== true) throw new Error('end inclusive must be true')
+	if (isRecalledAnchor(24, ranges) !== false) throw new Error('after end must be false')
+	if (isRecalledAnchor(undefined, ranges) !== false) throw new Error('undefined seq must be false')
+	if (recordRecalledRange(20, 23) !== false) throw new Error('duplicate range must not re-record')
+	console.log('recalled ranges OK')
+}
 
 // contentParts projection
 const parts = contentParts([
@@ -113,7 +134,15 @@ const localeStub = {
 	register(ns, dicts) { localeRegistrations.push({ ns, dicts }) },
 }
 const conversationEventsStub = {
-	register(def) { registrations.push({ definition: def }) },
+	register(def) {
+		registrations.push({ definition: def })
+		return () => {
+			const index = registrations.lastIndexOf({ definition: def })
+			if (index !== -1) registrations.splice(index, 1)
+		}
+	},
+	entries() { return [] },
+	subscribe() { return () => {} },
 }
 const ctxStub = {
 	get(name) {
@@ -206,6 +235,90 @@ const busyButton = (busyControlRendered.children ?? []).find((c) => c && c.props
 if (!busyButton || busyButton.props.disabled !== true) throw new Error('recall button should be disabled while the agent is running')
 console.log('recall button disabled while running')
 
+// a recalled user message vanishes from the transcript: the user override
+// reads the recorded recalled range and returns null for covered seqs
+{
+	recordRecalledRange(3, 9)
+	const hiddenEl = userReg.component({
+		node: {
+			key: 'chat:user:1',
+			kind: 'user',
+			id: 'user:1',
+			target: 'chat',
+			anchorSeq: 3,
+			location: { kind: 'turn', turn: { turn: 1 } },
+			visibility: 'visible',
+			data: { kind: 'user', seq: 3, time: 1, content: [{ type: 'text', text: '已被撤回的消息' }] },
+		},
+		sessionId: 's1',
+		loadImage: async () => 'data:image/png;base64,',
+		useSession: (selector) => selector({ running: false }),
+		t: (k) => k,
+	})
+	if (hiddenEl !== null) throw new Error('recalled user message should render null')
+	console.log('recalled user message hidden from the transcript')
+}
+
+// definition-level interception: EVERY framework chat-node kind is dropped
+// during assembly when its anchor falls inside a recalled range, and passed
+// through untouched otherwise. This is what makes long-context recalls hide
+// the WHOLE turn — subagent commands, compactions, retries, workflows, … — not
+// just the first answer's tool-call/turn-tail rows.
+{
+	recordRecalledRange(4, 9)
+	const makeBuilder = (kind) => (context) => ({
+		kind,
+		anchorSeq: context.candidateSeq,
+		target: 'chat',
+		data: {
+			seq: context.dataSeq,
+			finalNode: { seq: context.finalSeq },
+			closing: { finalNode: { seq: context.closingSeq } },
+		},
+	})
+	const kinds = ['steering', 'context', 'assistant-step', 'command', 'manual-compaction', 'compaction', 'model-retry', 'turn-error', 'turn-max-tokens', 'turn-tail', 'unknown', 'command-input', 'tool-call', 'workflow-run']
+	const defs = kinds.map((kind) => ({ kind, buildViewNode: makeBuilder(kind) }))
+	const unrelatedDef = { kind: 'input-message', buildViewNode: () => 'unrelated' }
+	installRecalledRowIntercepts({ entries: () => [...defs, unrelatedDef] })
+
+	const call = (def, candidateSeq, extra = {}) => def.buildViewNode({
+		candidateSeq,
+		dataSeq: extra.dataSeq ?? candidateSeq,
+		finalSeq: extra.finalSeq ?? candidateSeq,
+		closingSeq: extra.closingSeq ?? candidateSeq,
+	})
+
+	// every wrapped kind: anchor inside the range -> dropped
+	for (const def of defs) {
+		if (call(def, 5) !== null) throw new Error(`recalled ${def.kind} row must be dropped (anchor inside range)`)
+	}
+	// boundary/end inclusive
+	const toolDef = defs.find((d) => d.kind === 'tool-call')
+	if (call(toolDef, 4) !== null) throw new Error('boundary inclusive must drop')
+	if (call(toolDef, 9) !== null) throw new Error('end inclusive must drop')
+	// turn-tail resolves its anchor from the closing message seq
+	const tailDef = defs.find((d) => d.kind === 'turn-tail')
+	if (call(tailDef, 7, { closingSeq: 7 }) !== null) throw new Error('recalled turn-tail must drop (closing inside range)')
+	// outside the range: framework output passes through untouched
+	for (const def of defs) {
+		const out = call(def, 12)
+		if (out === null || out.kind !== def.kind || out.anchorSeq !== 12) throw new Error(`live ${def.kind} row must pass through`)
+	}
+	// other (non-conversation) definitions are never wrapped
+	if (unrelatedDef.buildViewNode() !== 'unrelated') throw new Error('unrelated definitions must not be wrapped')
+	// wrapping is idempotent per definition
+	const before = defs[0].buildViewNode
+	installRecalledRowIntercepts({ entries: () => [defs[0]] })
+	if (defs[0].buildViewNode !== before) throw new Error('wrapping must be idempotent per definition')
+	// the plugin's own recall definition and the user kind are never wrapped
+	const recallDef = { kind: 'recall', buildViewNode: () => 'recall-node' }
+	const userDef = { kind: 'user', buildViewNode: () => 'user-node' }
+	installRecalledRowIntercepts({ entries: () => [recallDef, userDef] })
+	if (recallDef.buildViewNode() !== 'recall-node') throw new Error('recall definition must not be wrapped')
+	if (userDef.buildViewNode() !== 'user-node') throw new Error('user definition must not be wrapped')
+	console.log('definition-level intercepts drop recalled rows of EVERY chat-node kind and pass everything else through')
+}
+
 // ── restore-to-input behavior: after a successful recall, the recalled user
 // message text lands in the session's composer draft (the opencode-style undo
 // affordance). The restore must wait for the recall request to settle.
@@ -234,10 +347,10 @@ console.log('recall button disabled while running')
 			kind: 'user',
 			id: 'user:1',
 			target: 'chat',
-			anchorSeq: 3,
+			anchorSeq: 30,
 			location: { kind: 'turn', turn: { turn: 1 } },
 			visibility: 'visible',
-			data: { kind: 'user', seq: 3, time: 1, content: [{ type: 'text', text: '把这段改一改' }] },
+			data: { kind: 'user', seq: 30, time: 1, content: [{ type: 'text', text: '把这段改一改' }] },
 		},
 		sessionId: 's1',
 		loadImage: async () => 'data:image/png;base64,',

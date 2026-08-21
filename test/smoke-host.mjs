@@ -133,4 +133,13 @@ if (g.status !== 405) throw new Error('method not allowed failed')
 console.log('derived after recalls:', s.deriveMessages().map((m) => m.id).join(',') || '(empty)')
 if (s.deriveMessages().length !== 0) throw new Error('derived history should be empty after both recalls')
 
+// 11) the recall is a durable, append-only tombstone: an empty assistant/message
+// surface replacement carrying data.recall — the log keeps every original event
+const log = s.events
+const tombstone = log.find((e) => e.data?.recall !== void 0)
+if (!tombstone) throw new Error('no recall tombstone in the log')
+if (tombstone.type !== 'assistant/message' || tombstone.surfaceOp?.op !== 'replace') throw new Error('tombstone must be an assistant/message surface replacement')
+if (tombstone.data.message.content.length !== 0) throw new Error('tombstone must carry empty content')
+if (log.length !== 7) throw new Error(`log must stay append-only; expected 7 events, got ${log.length}`)
+
 console.log('\nHOST SMOKE OK')

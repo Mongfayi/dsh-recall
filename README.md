@@ -1,6 +1,6 @@
 # dsh-recall
 
-对话撤回（recall）插件：把一条消息**及其之后的所有内容**从对话中移除——界面不再显示，模型也不再见——但**绝不回退任何代码/文件改动**。撤回以追加日志（append-only）中的 `session/recall` 墓碑事件持久化，重启后依然生效。
+对话撤回（recall）插件：把一条消息**及其之后的所有内容**从对话中移除——界面不再显示，模型也不再见——但**绝不回退任何代码/文件改动**。撤回以追加日志（append-only）中的一条持久墓碑事件（空内容 `assistant/message` 的 surface 替换）实现，重启后依然生效。
 
 ## 用法
 
@@ -13,9 +13,14 @@
 
 ## 实现
 
-- **宿主端**（`lib/index.js`）：`POST /recall` 路由（`{sessionId, messageId}` 或 `{sessionId, boundary}`），校验后调用 `session.recall(boundary)` 并 flush。错误码：`session-not-found` / `subagent-owned` / `agent-busy` / `message-not-found` / `recall-rejected`。
-- **浏览器端**（`lib/client.js`）：以 `priority: -1` 覆盖 `conversation.chat.node` 的 `user` keyed 渲染器，在每条用户消息旁渲染撤销按钮（点击以该用户消息 seq 为边界撤回），并复刻框架的用户气泡外观；「已撤回的消息」提示节点通过 `session/recall` 事件定义注册到 `recall` key。撤回提交成功后，被撤回用户消息的文本经 `conversation.input.for(scope).setDraft()` 写回输入框（仅文本，图片不恢复）。
-- **依赖的核心协议**（无插件接缝，需 dsh 运行时内置）：`dsh-session` 的 `session/recall` 事件类型 + surface 折叠召回支持；`dsh-client-runtime` 对已撤回事件的窗口过滤。
+- **宿主端**（`lib/index.js`）：`POST /recall` 路由（`{sessionId, messageId}` 或 `{sessionId, boundary}`），校验后**完全用既有会话协议**完成撤回（rc.8 核心没有 `Session.recall`）：
+  1. 边界必须是当前 surface 上的活跃消息节点（已撤回或被遮蔽 → `recall-rejected`）；
+  2. 追加**一条**持久墓碑：空内容的 `assistant/message`，`surfaceOp` 为 `{op:'replace', start: boundary, end}` 且 `sourceEventSeqs` 覆盖全部被遮蔽节点——空内容 assistant 消息不派生任何消息，`deriveMessages()` 收缩到 boundary 之前（模型不再见到被撤回内容），日志记录一个不删；
+  3. `data.recall = {boundary, end}` 标记墓碑（客户端提示节点），随常规 flush 持久化，重启后依然生效。
+  错误码：`session-not-found` / `subagent-owned` / `agent-busy` / `message-not-found` / `recall-rejected`。
+- **浏览器端**（`lib/client.js`）：以 `priority: -1` 覆盖 `conversation.chat.node` 的 `user` keyed 渲染器，在每条用户消息旁渲染撤销按钮（点击以该用户消息 seq 为边界撤回），并复刻框架的用户气泡外观；「已撤回的消息」提示节点匹配墓碑事件（`assistant/message` + `data.recall`）注册到 `recall` key。被撤回区间（boundary..end，含端点）内的**每一种**对话节点都在装配期被隐藏——这是长上下文下能整轮撤回的关键：rc.8 的 slot core 禁止被遮蔽的条目重新声明已被框架条目声明的子槽位（否则启动即报 `slot "..." is already declared`），因此无法为每一种节点都套一个渲染器过滤器；改为在 `conversationEvents` 上**统一包装每一个框架对话定义**的 `buildViewNode`：调用原构建器后，只要该行的锚点 seq（`anchorSeq` 或 `data.seq` / `data.finalNode.seq` / `data.closing.finalNode.seq`）落在已撤回区间内就返回 `null`，其余行与框架输出完全一致。这样 steering / context / assistant-step / command / manual-compaction / compaction / model-retry / turn-error / turn-max-tokens / turn-tail / unknown / command-input / tool-call / workflow-run 等全部节点种类一视同仁，长对话里的子智能体指令、压缩、重试、工作流等都会被一并撤回，而不是只撤回首轮的部分内容。被撤回区间由本插件的 `recall` 定义在匹配墓碑事件（`data.recall = {boundary, end}`）时记录（墓碑与本批被撤回事件在同一装配轮次，视图节点只在轮次结束后构建，因此区间表在构建时总是完整的）；实时会话收到墓碑后，会通过重新注册本插件的 `recall` 定义触发一次会话装配重建，使被撤回行立即消失（无需刷新页面）。本插件的 `recall` 定义与 `user` 渲染器不参与包装。
+  撤回提交成功后，被撤回用户消息的文本经 `conversation.input.for(scope).setDraft()` 写回输入框（仅文本，图片不恢复）。
+- **不依赖任何核心撤回协议**：不需要 `session/recall` 事件类型、`Session.recall` 或客户端窗口过滤——全部基于 rc.8 既有的 surface 替换协议与 keyed Chat Node 席位。
 
 ## 开发
 
