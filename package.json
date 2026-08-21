@@ -16,9 +16,7 @@
     },
     "client": {
       "platform": "web",
-      "external": [
-        "@deepseek-ai/dsh-client-ui-attachment"
-      ]
+      "external": []
     }
   },
   "license": "MIT",
