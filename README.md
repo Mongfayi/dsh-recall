@@ -38,12 +38,13 @@
 - **整轮隐藏**：被撤回区间（boundary..end，含端点）内的**每一种**对话节点都在装配期被隐藏。框架的 slot core 禁止被遮蔽的条目重新声明已被框架条目声明的子槽位，因此不能为每种节点套一个渲染器过滤器；改为在 `conversationEvents` 上**统一包装每个框架对话定义的 `buildViewNode`**：调用原构建器后，只要该行的锚点 seq（`anchorSeq` / `data.seq` / `data.finalNode.seq` / `data.closing.finalNode.seq`）落在已撤回区间内就返回 `null`，其余行与框架输出完全一致。这覆盖 steering / context / assistant-step / command / manual-compaction / compaction / model-retry / turn-error / turn-max-tokens / turn-tail / unknown / command-input / tool-call / workflow-run 等全部节点种类。
 - **「已撤回的消息」提示**：`recall` 定义匹配墓碑事件（`assistant/message` + `data.recall`）注册提示节点。
 - **实时更新**：墓碑到达实时会话后，通过重新注册本插件的 `recall` 定义触发一次会话装配重建，被撤回行立即消失（无需刷新页面）。
-- **恢复输入框**：文本经 `conversation.input.for(scope).setDraft()` 写回；图片经 `conversation.resolveImage()`（会话授权 URL）→ `fetch` → `conversation.createDraftImages()` 注册为草稿图片，`addImages()` 挂到图片轨道。被撤回附件仍保留在 append-only 日志中，恢复有真实数据源；单张失败不影响其余恢复，也绝不回滚已完成的撤回。
+- **恢复输入框**：文本经 `conversation.input.for(scope).setDraft()` 写回；图片经会话远程 `sessions.binding(sessionId).session.readAttachment()` 取回字节 → `conversation.createDraftImages()` 注册为草稿图片，`addImages()` 挂到图片轨道。被撤回附件仍保留在 append-only 日志中，恢复有真实数据源；单张失败不影响其余恢复，也绝不回滚已完成的撤回。
 
 ## 兼容性
 
 - 不需要 `session/recall` 事件类型、`Session.recall` 或客户端窗口过滤——全部基于框架既有的 surface 替换协议与 keyed Chat Node 席位。
-- 已适配并验证于 DSH `0.1.1-rc.1` 与 `0.1.1-rc.2`（相关 API 无破坏性变化）。
+- 已适配并验证于 DSH `0.1.1-rc.1`、`0.1.1-rc.2` 与 `0.1.2-alpha.1`。0.1.2 的适配点：定义注册服务由 `conversationEvents` 改为 `uiConversation.events`；子代理归属检查（原 `@deepseek-ai/dsh-api-remotes` 的 `hasApiRemoteSubagentOwner`）已内联进插件；图片恢复改走会话远程 `readAttachment`（原 `conversation.resolveImage` 已移除）；客户端 bundle 改经 `/plugins/??<id>/client.js` combo URL 服务。
+- 依赖 `@deepseek-ai/dsh-session`：经本插件 `node_modules/@deepseek-ai/dsh-session` 符号链接指向 dsh 源码部署的 `packages/core/session`，与宿主共享同一模块实例、同一版本（`git clone` 后执行 `ln -sfn ../../../../deepseek-harness/packages/core/session node_modules/@deepseek-ai/dsh-session` 重建）。
 
 ## 开发
 

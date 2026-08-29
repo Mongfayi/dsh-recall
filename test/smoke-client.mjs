@@ -1,5 +1,5 @@
 // Client-half smoke test: stub the browser module loader, document, react,
-// and the slots/locale/conversationEvents services; materialize the factory
+// and the slots/locale/uiConversation services; materialize the factory
 // and exercise the registrations (the keyed "user" Chat Node override), the
 // locale dictionaries, the message content projection, the recall button
 // rendering + confirm gate, the fallback user row's image path (through
@@ -158,11 +158,13 @@ const conversationEventsStub = {
 	entries() { return [] },
 	subscribe() { return () => {} },
 }
+// 0.1.2-alpha.1: the definitions registry moved to `uiConversation.events`
+const uiConversationStub = { events: conversationEventsStub }
 const ctxStub = {
 	get(name) {
 		if (name === 'slots') return slotsStub
 		if (name === 'locale') return localeStub
-		if (name === 'conversationEvents') return conversationEventsStub
+		if (name === 'uiConversation') return uiConversationStub
 		return undefined
 	},
 	effect(fn) { fn() }, // cordis runs effect callbacks immediately
@@ -175,7 +177,7 @@ const userReg = registrations.find((r) => r.options?.name === 'conversation.chat
 if (!userReg) throw new Error('user Chat Node renderer not registered')
 if (userReg.options.priority !== -1) throw new Error('user renderer should shadow the framework default at priority -1')
 if (registrations.some((r) => r.options?.name === 'conversation.chat.assistant-actions')) throw new Error('assistant-actions registrations should have been removed')
-if (registrations.filter((r) => r.definition === recallDefinition).length !== 1) throw new Error('recall definition not registered through conversationEvents')
+	if (registrations.filter((r) => r.definition === recallDefinition).length !== 1) throw new Error('recall definition not registered through uiConversation.events')
 const dict = localeRegistrations.find((r) => r.ns === 'recall')
 if (!dict) throw new Error('recall locale namespace not registered')
 const zhKeys = Object.keys(dict.dicts.zh).sort()
@@ -378,7 +380,7 @@ console.log('recall button disabled while running')
 	ctxStub.get = (name) => {
 		if (name === 'slots') return slotsStub
 		if (name === 'locale') return localeStub
-		if (name === 'conversationEvents') return conversationEventsStub
+		if (name === 'uiConversation') return uiConversationStub
 		if (name === 'conversation') return { input: { for: (actx) => (actx === scope ? inputFacade : void 0) } }
 		return undefined
 	}
@@ -420,10 +422,12 @@ if (restoreDraft('s1', '') !== false) throw new Error('restoreDraft must no-op o
 console.log('restoreDraft no-ops on empty text')
 
 // ── image restore: a recalled image message comes back into the composer
-// draft image rail — the durable attachment is resolved to a session
-// authorized URL, fetched into a File, registered as a draft image, and its
-// id appended to the input state (the recalled bytes survive in the
-// append-only log, so the restore has real source data).
+// draft image rail — the durable attachment is resolved through the session
+// remote (`sessions.binding(sessionId).session.readAttachment` → raw bytes,
+// the 0.1.2-alpha.1 replacement for the old `conversation.resolveImage` URL
+// helper), wrapped into a File, registered as a draft image, and its id
+// appended to the input state (the recalled bytes survive in the append-only
+// log, so the restore has real source data).
 {
 	const addedIds = []
 	const created = []
@@ -435,7 +439,6 @@ console.log('restoreDraft no-ops on empty text')
 	}
 	const conversation = {
 		input: { for: (actx) => (actx === scope ? facade : void 0) },
-		resolveImage: async (sid, attachment) => 'blob:recalled-' + attachment.attachmentId,
 		createDraftImages: (files) => files.map((file) => {
 			filesSeen.push(file)
 			const id = 'draft-' + created.length
@@ -443,27 +446,38 @@ console.log('restoreDraft no-ops on empty text')
 			return { id }
 		}),
 	}
-	ctxStub.sessions = { scope: (id) => (id === scope.id ? scope : void 0) }
+	ctxStub.sessions = {
+		scope: (id) => (id === scope.id ? scope : void 0),
+		binding: (id) => (id === scope.id ? {
+			session: {
+				readAttachment: async (attachmentId) => attachmentId === 'bad'
+					? { ok: false, error: { code: 'attachment-not-found', message: 'no such attachment' } }
+					: {
+						ok: true,
+						value: {
+							attachment: { attachmentId, mediaType: attachmentId === 'a2' ? 'image/jpeg' : 'image/png' },
+							data: new Uint8Array([1, 2, 3]),
+						},
+					},
+			},
+		} : void 0),
+	}
 	ctxStub.get = (name) => {
 		if (name === 'slots') return slotsStub
 		if (name === 'locale') return localeStub
-		if (name === 'conversationEvents') return conversationEventsStub
+		if (name === 'uiConversation') return uiConversationStub
 		if (name === 'conversation') return conversation
 		return undefined
 	}
-	const realFetch = globalThis.fetch
-	globalThis.fetch = async () => ({ ok: true, blob: async () => new Blob(['png-bytes'], { type: 'image/png' }) })
 	const restored = await restoreDraftImages('s1', [
 		{ attachment: { attachmentId: 'a1', mediaType: 'image/png', name: '截图.png', bytes: 9, width: 1, height: 1 } },
 		{ attachment: { attachmentId: 'a2', mediaType: 'image/jpeg', name: 'photo.jpg', bytes: 9, width: 1, height: 1 } },
 	])
-	globalThis.fetch = realFetch
 	if (restored !== true) throw new Error('restoreDraftImages should restore image ids')
 	if (addedIds.join(',') !== 'draft-0,draft-1') throw new Error('image ids should land in the draft rail: ' + addedIds.join(','))
-	if (filesSeen.length !== 2 || filesSeen[0].name !== '截图.png' || filesSeen[0].type !== 'image/png') throw new Error('restored files must carry the attachment identity: ' + JSON.stringify(filesSeen.map((f) => [f.name, f.type])))
+	if (filesSeen.length !== 2 || filesSeen[0].name !== '截图.png' || filesSeen[0].type !== 'image/png' || filesSeen[1].type !== 'image/jpeg') throw new Error('restored files must carry the attachment identity: ' + JSON.stringify(filesSeen.map((f) => [f.name, f.type])))
 	if (await restoreDraftImages('s1', []) !== false) throw new Error('restoreDraftImages must no-op on no images')
-	globalThis.fetch = async () => ({ ok: false })
-	if (await restoreDraftImages('s1', [{ attachment: { attachmentId: 'bad' } }]) !== false) throw new Error('a failed image fetch must not report success')
+	if (await restoreDraftImages('s1', [{ attachment: { attachmentId: 'bad' } }]) !== false) throw new Error('a failed attachment read must not report success')
 	console.log('recalled images restore into the composer draft rail')
 }
 
