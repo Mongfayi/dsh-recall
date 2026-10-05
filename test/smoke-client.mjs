@@ -70,18 +70,22 @@ if (!recallCss.includes('right:38px') || !recallCss.includes('bottom:0')) throw 
 
 // definition shape
 if (recallDefinition.kind !== 'recall' || recallDefinition.target !== 'chat') throw new Error('recall definition malformed')
+// 0.2.0-rc.2: the tombstone is a `system/message` surface replacement carrying
+// the positional startSeq/endSeq shape (an assistant/message can no longer be a
+// replacement at all — it may not cite `sourceEventSeqs`)
 const tombstone = {
-	type: 'assistant/message',
+	type: 'system/message',
 	seq: 9,
-	surfaceOp: { op: 'replace', start: 4, end: 7 },
+	surfaceOp: { op: 'replace', startSeq: 4, endSeq: 7 },
 	sourceEventSeqs: [4, 7],
-	data: { turn: 1, recall: { boundary: 4, end: 7 }, message: { id: 'r', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [] } },
+	data: { turn: 1, step: 1, recall: { boundary: 4, end: 7 }, message: { id: 'r', role: 'system', source: { kind: 'system-prompt' }, content: [] } },
 }
 const match = recallDefinition.match(tombstone)
 if (!match || match.id !== '9' || match.role !== 'start') throw new Error('recall definition match failed')
 if (recallDefinition.match({ type: 'user/message', seq: 1, data: {} }) !== null) throw new Error('recall definition must not match other events')
 if (recallDefinition.match({ type: 'assistant/message', seq: 2, surfaceOp: 'append', data: { message: {} } }) !== null) throw new Error('recall definition must not match plain assistant messages')
-const start = recallDefinition.start({}, { event: { type: 'assistant/message', seq: 9, time: 1, data: { recall: { boundary: 4, end: 7 } } } })
+if (recallDefinition.match({ type: 'system/message', seq: 3, surfaceOp: 'append', data: { message: { content: [{ type: 'text', text: 'sys' }] } } }) !== null) throw new Error('recall definition must not match ordinary system prompts')
+const start = recallDefinition.start({}, { event: { type: 'system/message', seq: 9, time: 1, data: { recall: { boundary: 4, end: 7 } } } })
 if (start.boundary !== 4 || start.end !== 7 || start.seq !== 9) throw new Error('recall definition start failed')
 console.log('recall definition OK')
 
@@ -336,21 +340,26 @@ console.log('recall button disabled while running')
 		closingSeq: extra.closingSeq ?? candidateSeq,
 	})
 
-	// every wrapped kind: anchor inside the range -> dropped
+	// every wrapped kind: anchor inside the range -> hidden, key intact
+	// (0.2.x contract: a definition must not withdraw a materialized target by
+	// returning null; it returns the same node with hidden visibility)
 	for (const def of defs) {
-		if (call(def, 5) !== null) throw new Error(`recalled ${def.kind} row must be dropped (anchor inside range)`)
+		const out = call(def, 5)
+		if (out === null || out.visibility !== 'hidden') throw new Error(`recalled ${def.kind} row must be hidden (anchor inside range)`)
+		if (out.kind !== def.kind) throw new Error(`hidden ${def.kind} row must keep its identity`)
 	}
 	// boundary/end inclusive
 	const toolDef = defs.find((d) => d.kind === 'tool-call')
-	if (call(toolDef, 4) !== null) throw new Error('boundary inclusive must drop')
-	if (call(toolDef, 9) !== null) throw new Error('end inclusive must drop')
+	if (call(toolDef, 4)?.visibility !== 'hidden') throw new Error('boundary inclusive must hide')
+	if (call(toolDef, 9)?.visibility !== 'hidden') throw new Error('end inclusive must hide')
 	// turn-tail resolves its anchor from the closing message seq
 	const tailDef = defs.find((d) => d.kind === 'turn-tail')
-	if (call(tailDef, 7, { closingSeq: 7 }) !== null) throw new Error('recalled turn-tail must drop (closing inside range)')
+	if (call(tailDef, 7, { closingSeq: 7 })?.visibility !== 'hidden') throw new Error('recalled turn-tail must hide (closing inside range)')
 	// outside the range: framework output passes through untouched
 	for (const def of defs) {
 		const out = call(def, 12)
 		if (out === null || out.kind !== def.kind || out.anchorSeq !== 12) throw new Error(`live ${def.kind} row must pass through`)
+		if (out.visibility !== undefined) throw new Error(`live ${def.kind} row must not gain a visibility flag`)
 	}
 	// other (non-conversation) definitions are never wrapped
 	if (unrelatedDef.buildViewNode() !== 'unrelated') throw new Error('unrelated definitions must not be wrapped')
@@ -422,29 +431,31 @@ if (restoreDraft('s1', '') !== false) throw new Error('restoreDraft must no-op o
 console.log('restoreDraft no-ops on empty text')
 
 // ── image restore: a recalled image message comes back into the composer
-// draft image rail — the durable attachment is resolved through the session
-// remote (`sessions.binding(sessionId).session.readAttachment` → raw bytes,
-// the 0.1.2-alpha.1 replacement for the old `conversation.resolveImage` URL
-// helper), wrapped into a File, registered as a draft image, and its id
-// appended to the input state (the recalled bytes survive in the append-only
-// log, so the restore has real source data).
+// draft rail — the durable attachment is resolved through the session remote
+// (`sessions.binding(sessionId).session.readAttachment` → raw bytes), wrapped
+// into a File, registered as a browser-owned draft attachment through the
+// 0.2.x `conversation.createDrafts(sessionId, files)` API, and its id appended
+// to the input state through `facade.addAttachments(ids)` (the recalled bytes
+// survive in the append-only log, so the restore has real source data).
 {
 	const addedIds = []
 	const created = []
 	const filesSeen = []
+	const released = []
 	const scope = { id: 's1' }
 	const facade = {
 		setDraft: () => {},
-		addImages: (ids) => { addedIds.push(...ids); return true },
+		addAttachments: (ids) => { addedIds.push(...ids); return true },
 	}
 	const conversation = {
 		input: { for: (actx) => (actx === scope ? facade : void 0) },
-		createDraftImages: (files) => files.map((file) => {
+		createDrafts: (sessionId, files) => files.map((file) => {
 			filesSeen.push(file)
 			const id = 'draft-' + created.length
-			created.push({ id })
+			created.push({ id, sessionId, file })
 			return { id }
 		}),
+		releaseDraftAttachments: (list) => { released.push(...list.map((d) => d.id)) },
 	}
 	ctxStub.sessions = {
 		scope: (id) => (id === scope.id ? scope : void 0),
@@ -478,6 +489,12 @@ console.log('restoreDraft no-ops on empty text')
 	if (filesSeen.length !== 2 || filesSeen[0].name !== '截图.png' || filesSeen[0].type !== 'image/png' || filesSeen[1].type !== 'image/jpeg') throw new Error('restored files must carry the attachment identity: ' + JSON.stringify(filesSeen.map((f) => [f.name, f.type])))
 	if (await restoreDraftImages('s1', []) !== false) throw new Error('restoreDraftImages must no-op on no images')
 	if (await restoreDraftImages('s1', [{ attachment: { attachmentId: 'bad' } }]) !== false) throw new Error('a failed attachment read must not report success')
+	// a composer that refuses the attachments (adjudicating/submitting) must not
+	// leak the runtime drafts it created
+	addedIds.length = 0
+	facade.addAttachments = () => false
+	if (await restoreDraftImages('s1', [{ attachment: { attachmentId: 'a1', mediaType: 'image/png' } }]) !== false) throw new Error('a refused addAttachments must report failure')
+	if (released.length !== 1 || released[0] !== 'draft-2') throw new Error('refused drafts must be released: ' + JSON.stringify(released))
 	console.log('recalled images restore into the composer draft rail')
 }
 

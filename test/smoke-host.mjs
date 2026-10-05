@@ -26,6 +26,9 @@ function buildSession() {
 			source: { kind: 'model', provider: 'p', model: 'm' },
 			content: [{ type: 'text', text: 'hi' }],
 		},
+		// 0.2.x restore contract (`assertAssistantSettlementShape`): an
+		// assistant/message must carry numeric turn/step AND an array `stream`
+		stream: [],
 	}, { surfaceOp: 'append' })
 	s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
 	return { s, user, assistant }
@@ -133,13 +136,29 @@ if (g.status !== 405) throw new Error('method not allowed failed')
 console.log('derived after recalls:', s.deriveMessages().map((m) => m.id).join(',') || '(empty)')
 if (s.deriveMessages().length !== 0) throw new Error('derived history should be empty after both recalls')
 
-// 11) the recall is a durable, append-only tombstone: an empty assistant/message
+// 11) the recall is a durable, append-only tombstone: an empty `system/message`
 // surface replacement carrying data.recall — the log keeps every original event
-const log = s.events
+// (`session.log` is the 0.2.x log field; the old `session.events` accessor is gone)
+const log = s.log
 const tombstone = log.find((e) => e.data?.recall !== void 0)
 if (!tombstone) throw new Error('no recall tombstone in the log')
-if (tombstone.type !== 'assistant/message' || tombstone.surfaceOp?.op !== 'replace') throw new Error('tombstone must be an assistant/message surface replacement')
+if (tombstone.type !== 'system/message' || tombstone.surfaceOp?.op !== 'replace') throw new Error('tombstone must be a system/message surface replacement')
 if (tombstone.data.message.content.length !== 0) throw new Error('tombstone must carry empty content')
+// 0.2.0-rc.2 renamed the positional bounds to startSeq/endSeq and requires the
+// tombstone's source list to cover every shadowed surface node
+if (typeof tombstone.surfaceOp.startSeq !== 'number' || typeof tombstone.surfaceOp.endSeq !== 'number') throw new Error('tombstone must use the startSeq/endSeq replace shape')
+if (!Array.isArray(tombstone.sourceEventSeqs) || tombstone.sourceEventSeqs.length === 0) throw new Error('tombstone must cite its shadowed source events')
+// an assistant/message may not carry sourceEventSeqs on 0.2.x, which is exactly
+// why the tombstone is a system/message
+if (tombstone.type === 'assistant/message') throw new Error('assistant/message cannot be a surface replacement on 0.2.x')
 if (log.length !== 7) throw new Error(`log must stay append-only; expected 7 events, got ${log.length}`)
+// 12) the durable log is still self-consistent: replaying it through the shipped
+// seed validator (Session.create) must accept every event we appended
+const replayed = Session.create('session-smoke-replay', [...log])
+if (replayed.deriveMessages().length !== 0) throw new Error('replayed history should be empty after both recalls')
+// the second recall swallowed the first tombstone's position too, so the
+// replayed surface holds exactly the LAST tombstone node
+const lastTombstone = log.filter((e) => e.data?.recall !== void 0).at(-1)
+if (replayed.surface.nodes.length !== 1 || replayed.surface.nodes[0] !== lastTombstone.seq) throw new Error('replayed surface should hold exactly the last tombstone')
 
 console.log('\nHOST SMOKE OK')
